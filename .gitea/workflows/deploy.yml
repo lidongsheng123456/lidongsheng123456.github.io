@@ -2,7 +2,7 @@ name: 工作流名称          # 自定义，如Build & Test
 on: [push, pull_request] # 触发条件：推送代码、提交PR时触发（支持手动触发、标签、定时等）
 jobs:
   build:              # 自定义，如build
-    runs-on: lds-runner      # 关键：匹配Runner的标签（注册时指定的--labels）
+    runs-on: lds      # 关键：匹配Runner的标签（注册时指定的--labels）
     steps:
       - name: Checkout   # 自定义，如Checkout代码
         uses: http://192.168.191.5:3000/lds/checkout.git  # 使用官方Action（Gitea自动拉取兼容的Action）
