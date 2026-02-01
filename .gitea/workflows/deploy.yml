@@ -1,12 +1,62 @@
-name: 工作流名称          # 自定义，如Build & Test
-on: [push, pull_request] # 触发条件：推送代码、提交PR时触发（支持手动触发、标签、定时等）
+name: 🚀 构建并部署到阿里云
+
+on:
+  push:
+    branches:
+      - main  # 或者你的主分支名称
+  workflow_dispatch:  # 允许手动触发
+
 jobs:
-  build:              # 自定义，如build
-    runs-on: bun      # 关键：匹配Runner的标签（注册时指定的--labels）
+  build-and-deploy:
+    runs-on: bun
+    
     steps:
-      - name: Checkout   # 自定义，如Checkout代码
-        uses: http://192.168.192.1:3000/git/checkout@main  # 使用官方Action（Gitea自动拉取兼容的Action）
-      - name: 执行shell命令   # 自定义，如执行shell命令
-        run: |           # 执行自定义命令（支持多行吗）
-          echo "Hello Gitea Actions!"
-          uname -a
+      - name: 📋 检出代码仓库
+        uses: http://192.168.192.1:3000/git/checkout@main
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: 🔍 调试信息
+        run: |
+          echo "📁 当前工作目录: $(pwd)"
+          echo "🌿 当前分支: ${{ gitea.ref_name }}"
+          echo "📦 仓库: ${{ gitea.repository }}"
+          echo "👤 操作者: ${{ gitea.actor }}"
+          echo "⚡ 触发事件: ${{ gitea.event_name }}"
+          echo "📅 构建时间: $(date)"
+          echo "📄 检查 workflow 文件:"
+          ls -la .gitea/workflows/ || echo "❌ .gitea/workflows 目录不存在"
+
+      # 3. 📦 安装依赖
+      - name: 📦 安装依赖
+        run: bun install --force
+
+      # 4. 🔨 构建项目
+      - name: 🔨 构建项目
+        run: bun run build
+
+      # 5. 📤 上传到阿里云服务器
+      - name: 📤 上传到阿里云服务器
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.ALIYUN_HOST }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+          port: ${{ secrets.ALIYUN_PORT }}
+          source: "dist/*"
+          target: /home/server/lds_blog
+
+      # 6. ✅ 执行部署后命令
+      - name: ✅ 执行部署后命令
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.ALIYUN_HOST }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+          port: ${{ secrets.ALIYUN_PORT }}
+          script: |
+            echo "Deployment completed at $(date)"
+            # 如果需要重启服务，可以在这里添加命令
+            # cd ${{ secrets.ALIYUN_TARGET_PATH }}
+            # pm2 restart your-app-name
