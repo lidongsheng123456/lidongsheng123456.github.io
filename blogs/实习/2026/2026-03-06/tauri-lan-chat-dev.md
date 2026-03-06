@@ -1,268 +1,449 @@
 ---
-title: 基于 Tauri + React 开发内网聊天工具 LanChat 的实战经验
+title: Tauri + React + DeepSeek AI 打造内网智能聊天工具 LanChat
 date: 2026-03-06
 tags:
  - tauri
  - rust
  - react
+ - deepseek
+ - ai
+ - mcp
  - websocket
  - 内网聊天
 categories:
  - 实习
 ---
 
-记录使用 Tauri 2 + React + TypeScript + Rust (warp) 开发内网聊天工具 **LanChat** 的完整过程，涵盖架构设计、核心功能实现、踩坑与解决方案。
+记录使用 Tauri 2 + React 19 + Rust + DeepSeek AI 开发内网智能聊天工具 **LanChat v2.0** 的完整过程。重点分享 AI 工具调用系统、MCP 协议服务、分层架构设计中的实现细节与踩坑经验。
 
-## 1. 项目背景与技术选型
+## 1. 项目背景
 
-公司内网环境下需要一个轻量级的局域网即时通讯工具，要求：
+公司内网环境下需要一个轻量级的局域网通讯工具，核心诉求：
 
-- **零配置**：无需服务器部署，打开即用
-- **文件传输**：支持图片、视频、任意文件的收发
-- **跨设备**：同一局域网内任意 Windows 设备可互联
-- **AI 聊天**：集成 LLM API 作为 AI 助手
+- 不依赖外网，局域网内直连通信
+- 不经过任何第三方服务器，消息完全私密
+- 支持图片、视频、任意文件的高速传输
+- **内置 AI 助手**，能浏览网页、操作文件、辅助编码
 
-最终选定技术栈：
+最终技术栈：
 
 | 层级 | 技术 | 说明 |
 |------|------|------|
-| 桌面框架 | Tauri 2 | Rust 后端 + WebView 前端，包体小 (~8MB) |
-| 前端 | React + TypeScript | Vite 构建，Lucide 图标 |
-| 后端服务 | Rust warp | 内嵌 HTTP + WebSocket 服务器 |
-| 实时通信 | WebSocket | 消息推送、用户上下线 |
-| AI 集成 | reqwest | Rust 端代理 LLM API 请求 |
-
-### 为什么选 Tauri 而不是 Electron？
-
-- Tauri 打包体积约 8MB，Electron 通常 150MB+
-- Tauri 使用系统 WebView，内存占用低
-- Rust 后端可以直接内嵌 warp 服务器，不需要额外进程
-- Tauri 2 的 Command 机制让前后端通信非常简洁
+| 桌面框架 | Tauri 2 | Rust 后端 + WebView 前端，包体约 8MB |
+| 前端 | React 19 + TypeScript | Vite 构建，原生 CSS 设计系统 |
+| 后端服务 | Rust + warp | 内嵌 HTTP + WebSocket + MCP 三合一服务 |
+| AI | DeepSeek API | Function Calling 多轮工具调用 |
+| MCP | JSON-RPC 2.0 + SSE | 标准化 AI 工具接口协议 |
 
 ## 2. 架构设计
 
+### 2.1 整体架构
+
 ```
-┌─────────────────────────────────────────┐
-│              Tauri Application           │
-│  ┌─────────────┐  ┌──────────────────┐  │
-│  │  React UI   │  │  Rust Backend    │  │
-│  │  (WebView)  │◄─┤  ┌────────────┐  │  │
-│  │             │  │  │ warp Server │  │  │
-│  │  ChatWindow │  │  │  - /ws      │  │  │
-│  │  UserList   │  │  │  - /upload  │  │  │
-│  │  AiChat     │  │  │  - /files   │  │  │
-│  │             │  │  └────────────┘  │  │
-│  │             │  │  Tauri Commands  │  │
-│  │             │──┤  - download_file │  │
-│  │             │  │  - chat_with_ai  │  │
-│  └─────────────┘  └──────────────────┘  │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                      LanChat v2.0                            │
+│                                                              │
+│  ┌─────────────────┐       ┌─────────────────────────────┐  │
+│  │  React 19 前端   │◄─────►│  Tauri 2 (Rust) 后端        │  │
+│  │  TypeScript      │       │                             │  │
+│  │                  │       │  commands/    ← Controller   │  │
+│  │  components/     │       │   ai_cmd / file / network   │  │
+│  │  hooks/          │       │                             │  │
+│  │  styles/         │       │  services/    ← Service     │  │
+│  │  config.ts       │       │   ai/    chat_service       │  │
+│  │                  │       │          tool_registry      │  │
+│  │                  │       │          utility_tools       │  │
+│  │                  │       │   web/   scraper / search   │  │
+│  │                  │       │   file/  download / tools   │  │
+│  │                  │       │   mcp_server                │  │
+│  │                  │       │   network_service           │  │
+│  │                  │       │                             │  │
+│  │                  │       │  models/      ← Model       │  │
+│  │                  │       │  server/      ← Infra       │  │
+│  │                  │       │  utils/       ← Utils       │  │
+│  │                  │       │  config.rs    ← Config      │  │
+│  └─────────────────┘       └─────────────────────────────┘  │
+└──────┬──────────────────────────────┬───────────────────┬────┘
+       │ WebSocket + HTTP            │ JSON-RPC 2.0      │
+       ▼                             ▼                   ▼
+┌──────────────┐            ┌──────────────┐    ┌──────────────┐
+│  局域网 LAN   │            │  MCP Server  │    │  DeepSeek AI │
+│  :9120       │            │  :9121       │    │  (外网 API)   │
+└──────────────┘            └──────────────┘    └──────────────┘
 ```
 
-核心思路：**Tauri 启动时在后台启动一个 warp HTTP/WebSocket 服务器**，监听 `0.0.0.0:9120`。同局域网的其他设备通过 WebSocket 连接到这台机器，实现聊天和文件传输。
+Tauri 启动时在后台同时启动两个服务：
+- **聊天服务** (:9120)：warp HTTP + WebSocket，处理消息收发和文件传输
+- **MCP 服务** (:9121)：JSON-RPC 2.0 over HTTP + SSE，暴露 AI 工具接口
 
-## 3. 核心功能实现
+### 2.2 后端分层（Java 解耦思想）
 
-### 3.1 WebSocket 实时通信
+借鉴 Java 的 Controller / Service / Model 分层，对 Rust 后端做了严格解耦：
 
-服务端使用 warp 的 WebSocket 支持，维护一个全局客户端列表：
+| 层级 | 目录 | 职责 | 规则 |
+|------|------|------|------|
+| Controller | `commands/` | Tauri IPC 命令 | 纯委托，不含业务逻辑 |
+| Service | `services/ai/` | AI 对话、工具注册与调度 | 按业务领域分组 |
+| | `services/web/` | 网页抓取、搜索引擎 | |
+| | `services/file/` | 文件下载、文件系统 CRUD | |
+| Model | `models/` | 数据结构定义 | 不引用 Service 层 |
+| Infra | `server/` | HTTP / WebSocket 路由和处理器 | |
+| Config | `config.rs` | 统一配置加载 | |
+
+严格约束：**所有源文件 < 300 行**，最大文件 220 行。
+
+## 3. AI 工具调用系统
+
+这是整个项目的核心亮点，也是开发工作量最大的部分。
+
+### 3.1 DeepSeek Function Calling
+
+DeepSeek API 兼容 OpenAI 的 Function Calling 协议。核心流程：
+
+```
+用户消息 → 携带 tools 定义发送给 AI
+         → AI 返回 tool_calls（要调用哪个工具、什么参数）
+         → Rust 后端执行工具，拿到结果
+         → 将结果作为 tool message 追加到对话
+         → 再次发送给 AI（AI 根据结果决定继续调工具还是回复用户）
+         → 最多循环 5 轮
+```
+
+Rust 端实现的核心循环：
 
 ```rust
-type Clients = Arc<Mutex<HashMap<String, Client>>>;
+pub async fn chat_with_tools(api_key: &str, messages: Vec<AiChatMessage>) -> Result<String, String> {
+    let client = build_http_client()?;
+    let tools = tool_registry::build_tool_definitions();
+    let mut conversation = messages;
 
+    for _round in 0..config::get().ai.max_tool_rounds {
+        let ai_resp = call_ai_api(&client, api_key, &conversation, Some(&tools)).await?;
+        let choice = ai_resp.choices.first().ok_or("No response")?;
+
+        if let Some(tool_calls) = &choice.message.tool_calls {
+            // AI 要求调用工具
+            conversation.push(/* assistant message with tool_calls */);
+            for tc in tool_calls {
+                let result = tool_registry::execute_tool(&tc.function.name, args).await;
+                conversation.push(AiChatMessage::tool_result(&tc.id, &tc.function.name, &result));
+            }
+        } else {
+            // AI 直接返回文本回复
+            return Ok(choice.message.content.clone().unwrap_or_default());
+        }
+    }
+    // 超过最大轮次，不带 tools 做最终总结
+    let final_resp = call_ai_api(&client, api_key, &conversation, None).await?;
+    Ok(final_resp.choices.first().and_then(|c| c.message.content.clone()).unwrap_or_default())
+}
+```
+
+### 3.2 工具注册表（tool_registry）
+
+所有 14 个工具的定义和执行调度集中在 `tool_registry.rs`，同时为 AI Service 和 MCP Server 提供统一接口，避免代码重复：
+
+```rust
+fn all_tools() -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        ("browse_website", "抓取并解析网页内容", json!({...})),
+        ("web_search", "搜索互联网", json!({...})),
+        ("read_file", "读取文件文本内容", json!({...})),
+        ("write_file", "创建或覆盖写入文件", json!({...})),
+        // ... 共 14 个工具
+    ]
+}
+
+pub async fn execute_tool(name: &str, args: Value) -> String {
+    match name {
+        "browse_website" => web_scraper::browse_website(&a.url).await,
+        "read_file" => file_tools::read_file(&a.path),
+        "write_file" => file_tools::write_file(&a.path, &a.content),
+        // ...
+    }
+}
+```
+
+这个设计的好处：
+- `ai_service.rs` 和 `mcp_server.rs` 都通过 `tool_registry` 获取工具定义和执行工具
+- 新增工具只需在 `all_tools()` 加一条记录 + 在对应 service 中实现函数
+- 两个入口的工具列表和行为始终一致
+
+### 3.3 14 项工具实现
+
+| 类别 | 工具 | 实现要点 |
+|------|------|----------|
+| **Web** | `browse_website` | `scraper` crate 解析 HTML，提取标题/正文/链接，跳过 script/style/nav |
+| | `fetch_url_raw` | 获取原始文本，适用于 API / JSON 请求 |
+| | `web_search` | 请求 DuckDuckGo HTML 版，解析 `.result` 元素 |
+| | `extract_webpage_images` | 提取所有 `img[src]`，解析相对 URL 为绝对 URL |
+| **文件** | `read_file` | 路径校验 + 读取文本 + 超长截断 (100K 字符) |
+| | `write_file` | 路径校验 + 自动创建父目录 + 写入 |
+| | `list_directory` | 分别收集目录和文件，按类型排序展示 |
+| | `create_directory` | `fs::create_dir_all` 递归创建 |
+| | `delete_path` | 区分文件/目录，分别调用 `remove_file`/`remove_dir_all` |
+| | `search_files` | 递归遍历，按文件名关键词匹配，最多 100 条 |
+| **工具** | `get_current_datetime` | `chrono::Local::now()`，含星期中文 |
+| | `encode_decode` | Base64 / URL / Hex 双向转换 |
+| | `get_ip_geolocation` | 调 ip-api.com 免费接口 |
+| | `text_stats` | 统计字符/词/行/字节/中文字符数 |
+
+### 3.4 安全防护
+
+文件系统工具涉及直接操作用户磁盘，必须做安全校验：
+
+```rust
+fn validate_path(path: &str) -> Result<PathBuf, String> {
+    let canonical = p.canonicalize()?; // 解析符号链接和 ..
+
+    let blocked = ["\\windows\\", "\\system32", "/etc/", "/usr/", "\\program files"];
+    for b in &blocked {
+        if path_str.contains(b) {
+            return Err(format!("禁止访问系统目录: {}", b));
+        }
+    }
+    Ok(canonical)
+}
+```
+
+Web 工具同样做了 SSRF 防护，拒绝 `localhost` / `127.0.0.1` / 内网网段的请求。
+
+### 3.5 前端工具状态提示
+
+AI 调用工具时前端不能只显示 "思考中..."，需要让用户知道 AI 在做什么。通过正则匹配用户消息内容来预判：
+
+```typescript
+function detectToolHint(content: string): string | null {
+  if (/网址|网页|url|http|浏览/i.test(lower)) return "正在浏览网页...";
+  if (/搜索|搜一下|查一下|search|百度|谷歌/i.test(lower)) return "正在搜索...";
+  if (/读取文件|查看文件|read.*file/i.test(lower)) return "正在读取文件...";
+  if (/写入文件|创建文件|write.*file|改.*bug/i.test(lower)) return "正在操作文件...";
+  // ...
+  return null;
+}
+```
+
+## 4. MCP 协议服务
+
+### 4.1 什么是 MCP
+
+[Model Context Protocol](https://modelcontextprotocol.io/) 是 Anthropic 提出的标准协议，让 AI 模型通过统一接口调用外部工具。LanChat 内置 MCP Server 意味着：
+
+- 任何支持 MCP 的 AI 客户端（Claude Desktop、Cursor 等）都可以连接 LanChat 使用其 14 项工具
+- LanChat 自身的 AI 助手也通过同一套工具定义工作
+
+### 4.2 实现
+
+MCP Server 基于 warp 实现 JSON-RPC 2.0 协议，只需处理三个方法：
+
+```rust
+async fn handle_rpc(req: JsonRpcRequest) -> JsonRpcResponse {
+    match req.method.as_str() {
+        "initialize" => /* 返回协议版本和能力 */,
+        "tools/list" => /* 调 tool_registry::build_mcp_tool_list() */,
+        "tools/call" => /* 调 tool_registry::execute_tool(name, args) */,
+        _ => JsonRpcResponse::error(req.id, -32601, "Method not found"),
+    }
+}
+```
+
+同时提供 SSE 端点（`/mcp/sse`）用于服务端推送通知。
+
+## 5. 聊天核心实现
+
+### 5.1 WebSocket 实时通信
+
+服务端使用 warp WebSocket，维护全局客户端列表 `Arc<RwLock<HashMap<String, Client>>>`：
+
+```rust
 let ws_route = warp::path("ws")
     .and(warp::ws())
-    .and(clients_filter.clone())
-    .and(messages_filter.clone())
+    .and(clients_filter)
+    .and(messages_filter)
     .and(warp::addr::remote())
-    .map(move |ws: warp::ws::Ws, clients, messages, addr| {
+    .map(|ws: warp::ws::Ws, clients, messages, addr| {
         ws.on_upgrade(move |socket| {
-            handle_connection(socket, clients, messages, addr)
+            ws_handler::handle_connection(socket, clients, messages, addr)
         })
     });
 ```
 
-前端使用自定义 `useChat` Hook 管理 WebSocket 连接，实现了：
+WebSocket 事件类型：
+- `join`：客户端注册昵称，返回 welcome + 历史消息
+- `message`：广播聊天消息（公共/私聊）
+- `users`：用户列表变更推送
 
-- **自动重连**：指数退避策略，断线后自动恢复
-- **消息持久化**：聊天记录存储到 localStorage
-- **历史合并**：重连后将服务端历史与本地消息合并去重
+前端 `useChat` Hook 实现了指数退避自动重连和 localStorage 消息持久化。
 
-```typescript
-const connect = useCallback(() => {
-  const ws = new WebSocket(`ws://${serverUrl}/ws`);
-  ws.onclose = () => {
-    // 指数退避重连
-    const delay = Math.min(
-      BASE_RECONNECT_DELAY * Math.pow(1.5, reconnectAttempts.current),
-      MAX_RECONNECT_DELAY
-    );
-    reconnectTimer.current = setTimeout(() => connect(), delay);
-  };
-}, [serverUrl, nickname]);
-```
+### 5.2 文件传输
 
-### 3.2 文件上传与传输
+文件通过 HTTP POST 上传，文件名格式 `{uuid}_{sanitized_name}.{ext}` 防止冲突和路径穿越。
 
-文件通过 HTTP POST 上传到服务器，存储在 `chat_files/` 目录：
-
-```rust
-let upload_route = warp::path("upload")
-    .and(warp::post())
-    .and(warp::body::bytes())
-    .and(warp::header::<String>("x-file-name"))
-    // ... 其他 header
-    .and_then(handle_upload);
-```
-
-上传后文件名格式为 `{uuid}_{sanitized_name}.{ext}`，避免冲突和路径穿越攻击。
-
-### 3.3 远程文件下载（踩坑重点）
-
-本机下载直接从 `chat_files/` 目录复制到用户下载目录。远程机器则通过 HTTP 回落下载。
-
-**踩坑：远程下载 502 Bad Gateway**
-
-初始实现使用 `reqwest::get()` 下载文件，在远程机器上始终返回 502。排查后发现：
-
-> **根因**：Windows 系统配置了 HTTP 代理，`reqwest` 默认使用系统代理设置。LAN 内部 IP 请求被代理服务器拦截，代理无法到达内网地址，返回 502。
-
-**解决方案**：使用 `no_proxy()` 绕过系统代理：
+远程下载文件时必须绕过系统代理：
 
 ```rust
 let client = reqwest::Client::builder()
-    .no_proxy()  // 关键！绕过系统代理
-    .build()
-    .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
-let url = format!("http://{}/files/{}", server_url, stored_name);
-let response = client.get(&url).send().await?;
+    .no_proxy()  // 企业内网环境关键配置
+    .build()?;
 ```
 
-这是一个在企业内网环境中非常常见的坑，值得记住。
+### 5.3 全局传输状态
 
-### 3.4 AI 聊天集成
-
-通过 Tauri Command 在 Rust 端代理 LLM API 请求，绕过 WebView 的 CORS 限制：
-
-```rust
-#[tauri::command]
-async fn chat_with_ai(api_key: String, messages: Vec<AiChatMessage>) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()?;
-
-    let response = client
-        .post("https://api.longcat.chat/openai/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&body)
-        .send()
-        .await?;
-    // ...
-}
-```
-
-前端通过 `useAiChat` Hook 管理 AI 聊天状态，消息持久化到 localStorage。
-
-### 3.5 全局传输状态管理
-
-**问题**：上传/下载状态存在组件本地 state 中，切换聊天频道后状态丢失，用户不知道传输还在进行中。
-
-**解决方案**：创建全局 `TransferContext`，在 App 顶层提供传输状态，配合浮动指示器组件：
+上传/下载状态通过 React Context 全局管理，配合浮动指示器组件跨页面持久显示：
 
 ```typescript
-// TransferProvider 管理所有传输任务
 export interface TransferItem {
   id: string;
   type: "upload" | "download";
   fileName: string;
   status: "active" | "success" | "error";
 }
-
-// 浮动指示器固定在右下角，跨页面持久显示
-<div className="transfer-indicator">
-  {transfers.map(t => (
-    <div className={`transfer-item transfer-item--${t.status}`}>
-      {/* spinner / 文件名 / 状态 */}
-    </div>
-  ))}
-</div>
 ```
 
-完成的传输任务 3 秒后自动移除，错误任务可手动关闭。
+## 6. 统一配置系统
 
-## 4. UI/UX 优化经验
+为避免配置散落在代码各处，设计了前后端统一的配置方案：
 
-### 4.1 拖拽上传覆盖层定位
+```
+lanchat.config.json (项目根目录)
+       │
+       ├─► config.rs (Rust: include_str! 编译时嵌入，OnceLock 全局访问)
+       │
+       └─► config.ts (前端: 通过 Tauri Command 从后端获取，缓存后同步访问)
+```
 
-**问题**：拖拽覆盖层放在 `chat-messages`（可滚动区域）内部，使用 `position: absolute`。当消息多时滚动到底部，覆盖层在顶部不可见。
+Rust 端关键实现：
 
-**解决方案**：将覆盖层移到 `chat-window` 级别（不可滚动），确保始终覆盖整个聊天区域。
+```rust
+const CONFIG_JSON: &str = include_str!("../../lanchat.config.json");
+static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
-### 4.2 深色背景上的 UI 元素
-
-绿色消息气泡（自己发的消息）上的下载旋转器使用了默认的绿色边框，在绿色背景上几乎不可见。
-
-**解决方案**：为 `isMine` 状态添加白色变体：
-
-```css
-.chat-upload-spinner--white {
-  border-color: white;
-  border-top-color: transparent;
+pub fn get() -> &'static AppConfig {
+    CONFIG.get_or_init(|| serde_json::from_str(CONFIG_JSON).expect("Invalid config"))
 }
 ```
 
-### 4.3 图片预览 Portal
+好处：
+- 修改配置只需编辑一个 JSON 文件
+- 编译时嵌入，运行时零 IO
+- 前后端配置值来源一致
 
-图片预览弹窗如果渲染在消息气泡内部，会被父元素的 `overflow: hidden` 裁剪。使用 `ReactDOM.createPortal` 将预览弹窗渲染到 `document.body`，确保全屏覆盖。
+## 7. API Key 安全方案
 
-## 5. 关键踩坑总结
+DeepSeek API Key 不能出现在前端代码或配置文件中。最终方案：
+
+```rust
+// 编译时通过环境变量嵌入二进制
+const EMBEDDED_KEY: Option<&str> = option_env!("DEEPSEEK_API_KEY");
+
+fn read_api_key() -> Result<String, String> {
+    if let Some(key) = EMBEDDED_KEY {
+        if !key.is_empty() { return Ok(key.to_string()); }
+    }
+    // 回退：OS 凭据管理器 (keyring)
+    let entry = keyring::Entry::new("lanchat", "deepseek_api_key")?;
+    entry.get_password()
+}
+```
+
+打包时只需设置环境变量：
+
+```bash
+$env:DEEPSEEK_API_KEY = "sk-xxx"
+npm run tauri build
+```
+
+Key 嵌入 Rust 编译后的二进制文件中，前端代码和配置文件里完全不可见。
+
+## 8. 踩坑与解决方案
 
 | 问题 | 根因 | 解决方案 |
 |------|------|----------|
-| 远程下载 502 | reqwest 走系统 HTTP 代理 | `Client::builder().no_proxy()` |
+| 远程文件下载 502 | reqwest 默认走系统 HTTP 代理，代理无法到达内网 IP | `Client::builder().no_proxy()` |
+| `ai_service.rs` 超 300 行 | 工具定义和执行逻辑与 AI 调用逻辑耦合 | 提取 `tool_registry.rs` 集中管理 |
+| `handlers.rs` 超 300 行 | WebSocket + 上传 + 下载三种职责混在一起 | 拆分为 `ws_handler.rs` + `file_handler.rs` |
+| `network_cmd.rs` 混入业务逻辑 | Command 层直接调 `local_ip_address` 和 `hostname` | 下沉到 `network_service.rs` |
+| 聊天输入框跑到窗口顶部 | 组件拆分后渲染顺序错误 | `<ChatInput />` 移到 `chat-messages` div 之后 |
+| 图片预览被裁剪 | 父元素 `overflow: hidden` | `ReactDOM.createPortal` 渲染到 body |
 | 拖拽覆盖层不可见 | `position: absolute` 在滚动容器内 | 移到不可滚动的父容器 |
-| 上传/下载状态丢失 | 状态在组件 local state | 提升到全局 Context |
-| 图片预览被裁剪 | 父元素 `overflow: hidden` | `ReactDOM.createPortal` |
-| WebView CORS 限制 | 浏览器跨域策略 | Rust 端代理 API 请求 |
-| 文件名路径穿越 | 用户可构造恶意文件名 | `sanitize_filename` + 路径校验 |
+| CSS 文件 1855 行 | 所有样式堆在 `index.css` | 拆分为 9 个模块化 CSS 文件 |
+| WebView CORS | 浏览器跨域策略限制 AI API 请求 | Rust 端代理 API 请求 |
+| 文件名路径穿越 | 用户可构造恶意文件名 | `sanitize_filename` + `canonicalize` 校验 |
 
-## 6. 项目结构
+## 9. 项目结构
 
 ```
 tauri-chat/
-├── src/                          # React 前端
-│   ├── App.tsx                   # 主应用（登录/聊天路由）
+├── lanchat.config.json              # 统一配置文件
+├── src/                             # React 前端
+│   ├── App.tsx                      # 主应用入口
+│   ├── config.ts                    # 前端配置加载
 │   ├── components/
-│   │   ├── ChatWindow.tsx        # 聊天窗口（消息列表、输入、文件上传）
-│   │   ├── AiChatWindow.tsx      # AI 聊天窗口
-│   │   ├── MessageBubble.tsx     # 消息气泡（文本/图片/视频/文件）
-│   │   ├── UserList.tsx          # 侧边栏用户列表
-│   │   ├── LoginScreen.tsx       # 登录界面
-│   │   ├── ImagePreview.tsx      # 图片预览 Portal
-│   │   └── TransferIndicator.tsx # 浮动传输进度指示器
+│   │   ├── ChatWindow.tsx           # 聊天窗口
+│   │   ├── ChatInput.tsx            # 输入框组件
+│   │   ├── AiChatWindow.tsx         # AI 聊天窗口
+│   │   ├── MarkdownRenderer.tsx     # Markdown 渲染
+│   │   ├── MessageBubble.tsx        # 消息气泡
+│   │   ├── UserList.tsx             # 侧边栏用户列表
+│   │   ├── LoginScreen.tsx          # 登录界面
+│   │   ├── ImagePreview.tsx         # 图片预览
+│   │   └── TransferIndicator.tsx    # 传输进度指示器
 │   ├── hooks/
-│   │   ├── useChat.ts            # WebSocket 聊天 Hook
-│   │   ├── useAiChat.ts          # AI 聊天 Hook
-│   │   ├── useTransfers.tsx      # 全局传输状态 Context
-│   │   └── useLocalStorage.ts    # localStorage Hook
-│   └── index.css                 # 全局样式
-├── src-tauri/
-│   ├── src/
-│   │   ├── lib.rs                # Tauri Commands（下载、AI 聊天）
-│   │   └── server.rs             # warp HTTP/WebSocket 服务器
-│   ├── Cargo.toml
-│   └── tauri.conf.json
+│   │   ├── useChat.ts               # WebSocket 聊天
+│   │   ├── useAiChat.ts             # AI 聊天（工具提示、上下文管理）
+│   │   ├── useTransfers.tsx         # 全局传输状态
+│   │   └── useLocalStorage.ts       # localStorage
+│   └── styles/                      # 模块化 CSS（9 个文件）
+│       ├── base.css                 # 全局变量、重置、布局
+│       ├── chat.css                 # 聊天窗口
+│       ├── chat-input.css           # 输入区域
+│       ├── message.css              # 消息气泡
+│       ├── ai.css                   # AI 动画
+│       ├── markdown.css             # Markdown 样式
+│       └── ...
+├── src-tauri/src/                   # Rust 后端
+│   ├── lib.rs                       # Tauri 入口
+│   ├── config.rs                    # 配置加载（include_str! + OnceLock）
+│   ├── commands/                    # Controller 层
+│   │   ├── ai_cmd.rs                # AI 聊天 + API Key 管理
+│   │   ├── file_cmd.rs              # 文件下载
+│   │   ├── network_cmd.rs           # 网络信息
+│   │   └── config_cmd.rs            # 前端配置
+│   ├── services/                    # Service 层（按领域分组）
+│   │   ├── ai/
+│   │   │   ├── chat_service.rs      # DeepSeek API 调用 + 多轮工具循环
+│   │   │   ├── tool_registry.rs     # 14 项工具定义 + 统一调度
+│   │   │   └── utility_tools.rs     # 时间/编码/IP/文本工具
+│   │   ├── web/
+│   │   │   ├── scraper.rs           # 网页抓取与解析
+│   │   │   └── search.rs            # DuckDuckGo 搜索 + 图片提取
+│   │   ├── file/
+│   │   │   ├── download.rs          # 聊天文件下载
+│   │   │   └── tools.rs             # 文件系统 CRUD（AI 工具）
+│   │   ├── mcp_server.rs            # MCP JSON-RPC 2.0 服务
+│   │   └── network_service.rs       # 网络信息
+│   ├── models/                      # Model 层
+│   │   ├── ai.rs                    # AI 消息、工具参数结构体
+│   │   ├── chat.rs                  # 聊天消息、WebSocket 类型
+│   │   └── network.rs               # 网络接口类型
+│   ├── server/                      # 基础设施层
+│   │   ├── routes.rs                # warp 路由定义
+│   │   ├── ws_handler.rs            # WebSocket 连接和消息处理
+│   │   ├── file_handler.rs          # 文件上传和下载处理
+│   │   └── state.rs                 # 共享状态
+│   └── utils/
+│       └── filename.rs              # 文件名清洗
 └── package.json
 ```
 
-## 7. 总结
+## 10. 总结
 
-这个项目的核心价值在于 **Tauri 的双层架构**：
+这个项目经历了从单文件到分层架构、从简单问答到 14 项工具调用的完整演进。几个核心收获：
 
-- **前端**：React 负责 UI 渲染和用户交互，开发效率高
-- **后端**：Rust 负责网络服务、文件操作、API 代理，性能和安全性好
+**Tauri 的双层架构优势**：WebView 无法处理的问题（CORS、系统代理、文件系统操作、密钥保护），Rust Command 都能优雅解决。
 
-Tauri 2 的 Command 机制让两者之间的通信非常自然。遇到 WebView 无法处理的场景（CORS、文件系统操作、系统代理），都可以通过 Rust Command 绕过。
+**AI Function Calling 的工程化**：不只是拼接 prompt，而是设计工具注册表、统一调度、安全校验、前端状态提示的完整闭环。同一套工具同时服务 AI 对话和 MCP 协议，代码复用率高。
 
-最大的收获是理解了**企业内网环境的特殊性**：系统代理、防火墙、不同机器间的网络差异，这些在开发环境中很难复现，需要在实际部署中反复测试。
+**分层解耦的价值**：将后端从扁平结构重构为 `commands → services/{ai,web,file} → models` 三层后，新增工具只需在对应 service 写实现 + registry 加一行，不需要改动 AI 调用逻辑或 MCP 服务代码。
+
+**企业内网的特殊性**：系统代理、防火墙、不同机器间的网络差异，这些在开发环境中很难复现，`no_proxy()` 这类看似简单的配置在实际部署中至关重要。
