@@ -3,7 +3,6 @@ import { defineUserConfig } from "vuepress";
 import recoTheme from "vuepress-theme-reco";
 
 export default defineUserConfig({
-  base: '/Blog/',
   title: "东sheng&",
   description: "Just playing around",
   bundler: viteBundler(),
